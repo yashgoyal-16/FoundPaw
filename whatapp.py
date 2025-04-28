@@ -1,35 +1,53 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from flask_cors import CORS
-from twilio.twiml.messaging_response import MessagingResponse
 from datetime import datetime
 import uuid
-import json
 import os
 import numpy as np
 import re
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import requests
 from PIL import Image
 import torchvision.transforms as transforms
 import torch
 import torchvision.models as models
+from pymongo import MongoClient
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from twilio.twiml.messaging_response import MessagingResponse
 
+# Flask Setup
 app = Flask(__name__)
 CORS(app)
+
+# Constants
 UPLOAD_FOLDER = "static/uploads"
-DB_FILE = "data.json"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# MongoDB Setup
+client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
+db = client["foundpaw"]
+dogs_collection = db["dogs"]
 
 # Load ResNet model
 resnet = models.resnet18(pretrained=True)
 resnet = torch.nn.Sequential(*(list(resnet.children())[:-1]))
 resnet.eval()
+
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
 ])
 
 vectorizer = CountVectorizer()
+
+def download_image(url, save_path):
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(save_path, 'wb') as f:
+            f.write(response.content)
+    else:
+        raise Exception(f"Failed to download image. Status code: {response.status_code}")
+
 def image_to_embedding(img_path):
     img = Image.open(img_path).convert('RGB')
     img_tensor = transform(img).unsqueeze(0)
@@ -45,36 +63,23 @@ def text_to_embedding(text):
     vectors = vectorizer.fit_transform([text])
     return vectors.toarray()[0]
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    else:
-        return {"dogs": []}
-
-def save_db(data):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f)
-
-def find_similar(image_emb, text_emb, lat, lon, opposite_status):
-    db = load_db()
+def match_dog(image_emb, text_emb, lat, lon, opposite_status):
     matches = []
-    for entry in db["dogs"]:
-        if entry["status"] != opposite_status:
-            continue
-
+    for entry in dogs_collection.find({"status": opposite_status}):
         dist_km = haversine_distance(lat, lon, entry["lat"], entry["lon"])
         if dist_km > 80:
             continue
 
         image_sim = cosine_similarity([image_emb], [entry["embedding"]])[0][0]
         text_sim = cosine_similarity([text_emb], [entry["text_embedding"]])[0][0]
-        total_sim = 0.5 * image_sim + 0.5 * text_sim
+        score = 0.5 * image_sim + 0.5 * text_sim
 
-        matches.append({"score": total_sim, **entry})
+        entry["_id"] = str(entry["_id"])
+        entry["score"] = score
+        matches.append(entry)
 
     matches.sort(key=lambda x: x["score"], reverse=True)
-    return matches[:3] if matches else None
+    return matches[:3]
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     from math import radians, sin, cos, sqrt, atan2
@@ -98,7 +103,7 @@ def whatsapp():
         return str(resp)
 
     status_match = re.search(r"(lost|found)", body)
-    location_match = re.search(r"location:\s*([0-9.]+),\s*([0-9.]+)", body)
+    location_match = re.search(r"location:\s*([0-9.\-]+),\s*([0-9.\-]+)", body)
     phone_match = re.search(r"phone:\s*(\d+)", body)
     description = body.replace("\n", " ")
 
@@ -112,12 +117,20 @@ def whatsapp():
 
     img_name = f"{uuid.uuid4()}.jpg"
     img_path = os.path.join(UPLOAD_FOLDER, img_name)
-    os.system(f"wget \"{media_url}\" -O \"{img_path}\"")
+
+    # Download image properly using requests
+    try:
+        download_image(media_url, img_path)
+    except Exception as e:
+        resp.message(f"❌ Failed to download image. Error: {str(e)}")
+        return str(resp)
 
     image_emb = image_to_embedding(img_path)
     processed_desc = preprocess_text(description)
     text_emb = text_to_embedding(processed_desc)
-    matches = find_similar(image_emb, text_emb, lat, lon, "found" if status == "lost" else "lost")
+
+    opposite_status = "found" if status == "lost" else "lost"
+    matches = match_dog(image_emb, text_emb, lat, lon, opposite_status)
 
     if matches:
         reply = "✅ Possible match found near you!\n"
@@ -125,8 +138,7 @@ def whatsapp():
             reply += f"\n📍 *Description*: {m['text']}\n📞 *Phone*: {m['phone']}\n🌍 *Location*: {m['lat']}, {m['lon']}\n🖼️ Image: {request.url_root}static/uploads/{m['image_name']}\n"
         resp.message(reply)
     else:
-        db = load_db()
-        db["dogs"].append({
+        dogs_collection.insert_one({
             "image_name": img_name,
             "embedding": image_emb.tolist(),
             "text_embedding": text_emb.tolist(),
@@ -137,10 +149,9 @@ def whatsapp():
             "phone": phone,
             "timestamp": datetime.now().isoformat()
         })
-        save_db(db)
         resp.message("📦 Dog info saved. We'll notify you if we find a match. 🙏")
 
     return str(resp)
 
 if __name__ == "__main__":
-    app.run(port=5001)
+    app.run(port=5000)
