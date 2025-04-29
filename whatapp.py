@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, send_from_directory
 from flask_cors import CORS
 from datetime import datetime
 import uuid
@@ -22,7 +22,14 @@ CORS(app)
 # Constants
 UPLOAD_FOLDER = "static/uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
+@app.route('/uploads/<filename>')
+def get_image(filename):
+    """Serve the image from the uploads folder."""
+    return send_from_directory(UPLOAD_FOLDER, filename)
+@app.route('/uploads/<filename>')
+def serve_image(filename):
+    """Route to serve the image using the get_image function."""
+    return get_image(filename)
 # MongoDB Setup
 client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
 db = client["foundpaw"]
@@ -91,21 +98,31 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
+    print(dict(request.form))
     from_number = request.form.get("From", "")
     body = request.form.get("Body", "").lower()
-    media_url = request.form.get("MediaUrl0")
-    media_type = request.form.get("MediaContentType0")
+    print(body)
 
-    resp = MessagingResponse()
-
-    if not media_url or not ("image" in media_type):
+    # ✅ Get uploaded image from form-data
+    file = request.files.get("image")
+    if not file or not file.content_type.startswith("image"):
+        print("no image")
+        resp = MessagingResponse()
         resp.message("❌ Please send a photo of the dog.")
         return str(resp)
 
+    # ✅ Save uploaded image
+    img_name =f"{uuid.uuid4()}.jpg"
+    img_path = os.path.join(UPLOAD_FOLDER, img_name)
+    file.save(img_path)
+
+    # ✅ Extract info from body
     status_match = re.search(r"(lost|found)", body)
     location_match = re.search(r"location:\s*([0-9.\-]+),\s*([0-9.\-]+)", body)
     phone_match = re.search(r"phone:\s*(\d+)", body)
     description = body.replace("\n", " ")
+
+    resp = MessagingResponse()
 
     if not (status_match and location_match and phone_match):
         resp.message("⚠️ Format: 'Lost dog golden retriever... Location: 30.9,75.8 Phone: 98xxxx'")
@@ -115,20 +132,12 @@ def whatsapp():
     lat, lon = float(location_match.group(1)), float(location_match.group(2))
     phone = phone_match.group(1)
 
-    img_name = f"{uuid.uuid4()}.jpg"
-    img_path = os.path.join(UPLOAD_FOLDER, img_name)
-
-    # Download image properly using requests
-    try:
-        download_image(media_url, img_path)
-    except Exception as e:
-        resp.message(f"❌ Failed to download image. Error: {str(e)}")
-        return str(resp)
-
+    # ✅ Process image and text
     image_emb = image_to_embedding(img_path)
     processed_desc = preprocess_text(description)
     text_emb = text_to_embedding(processed_desc)
 
+    # ✅ Check for matches
     opposite_status = "found" if status == "lost" else "lost"
     matches = match_dog(image_emb, text_emb, lat, lon, opposite_status)
 
@@ -149,9 +158,11 @@ def whatsapp():
             "phone": phone,
             "timestamp": datetime.now().isoformat()
         })
+        print("reached")
         resp.message("📦 Dog info saved. We'll notify you if we find a match. 🙏")
 
     return str(resp)
+
 
 if __name__ == "__main__":
     app.run(port=5000)
