@@ -14,106 +14,44 @@ from pymongo import MongoClient
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from twilio.twiml.messaging_response import MessagingResponse
+from waitress import serve
+import logging
 
 # Flask Setup
 app = Flask(__name__)
 CORS(app)
 
-# Constants
-UPLOAD_FOLDER = "static/uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# Production Config
+app.config['DEBUG'] = False
+app.config['UPLOAD_FOLDER'] = "static/uploads"
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 @app.route('/uploads/<filename>')
 def get_image(filename):
     """Serve the image from the uploads folder."""
-    return send_from_directory(UPLOAD_FOLDER, filename)
-@app.route('/uploads/<filename>')
-def serve_image(filename):
-    """Route to serve the image using the get_image function."""
-    return get_image(filename)
-# MongoDB Setup
-client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
-db = client["foundpaw"]
-dogs_collection = db["dogs"]
-
-# Load ResNet model
-resnet = models.resnet18(pretrained=True)
-resnet = torch.nn.Sequential(*(list(resnet.children())[:-1]))
-resnet.eval()
-
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
-
-vectorizer = CountVectorizer()
-
-def download_image(url, save_path):
-    response = requests.get(url)
-    if response.status_code == 200:
-        with open(save_path, 'wb') as f:
-            f.write(response.content)
-    else:
-        raise Exception(f"Failed to download image. Status code: {response.status_code}")
-
-def image_to_embedding(img_path):
-    img = Image.open(img_path).convert('RGB')
-    img_tensor = transform(img).unsqueeze(0)
-    with torch.no_grad():
-        embedding = resnet(img_tensor).squeeze().numpy()
-    return embedding
-
-def preprocess_text(text):
-    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
-    return text.lower()
-
-def text_to_embedding(text):
-    vectors = vectorizer.fit_transform([text])
-    return vectors.toarray()[0]
-
-def match_dog(image_emb, text_emb, lat, lon, opposite_status):
-    matches = []
-    for entry in dogs_collection.find({"status": opposite_status}):
-        dist_km = haversine_distance(lat, lon, entry["lat"], entry["lon"])
-        if dist_km > 80:
-            continue
-
-        image_sim = cosine_similarity([image_emb], [entry["embedding"]])[0][0]
-        text_sim = cosine_similarity([text_emb], [entry["text_embedding"]])[0][0]
-        score = 0.5 * image_sim + 0.5 * text_sim
-
-        entry["_id"] = str(entry["_id"])
-        entry["score"] = score
-        matches.append(entry)
-
-    matches.sort(key=lambda x: x["score"], reverse=True)
-    return matches[:3]
-
-def haversine_distance(lat1, lon1, lat2, lon2):
-    from math import radians, sin, cos, sqrt, atan2
-    R = 6371
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    return R * (2 * atan2(sqrt(a), sqrt(1 - a)))
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-    print(dict(request.form))
-    from_number = request.form.get("From", "")
+    logger.info("Received message from: %s", request.form.get("From", ""))
     body = request.form.get("Body", "").lower()
-    print(body)
+    logger.info("Body of the message: %s", body)
 
     # ✅ Get uploaded image from form-data
     file = request.files.get("image")
     if not file or not file.content_type.startswith("image"):
-        print("no image")
+        logger.warning("No image found or invalid file type.")
         resp = MessagingResponse()
         resp.message("❌ Please send a photo of the dog.")
         return str(resp)
 
     # ✅ Save uploaded image
-    img_name =f"{uuid.uuid4()}.jpg"
-    img_path = os.path.join(UPLOAD_FOLDER, img_name)
+    img_name = f"{uuid.uuid4()}.jpg"
+    img_path = os.path.join(app.config['UPLOAD_FOLDER'], img_name)
     file.save(img_path)
 
     # ✅ Extract info from body
@@ -158,11 +96,80 @@ def whatsapp():
             "phone": phone,
             "timestamp": datetime.now().isoformat()
         })
-        print("reached")
+        logger.info("Dog info saved.")
         resp.message("📦 Dog info saved. We'll notify you if we find a match. 🙏")
 
     return str(resp)
 
+# MongoDB Setup
+client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
+db = client["foundpaw"]
+dogs_collection = db["dogs"]
+
+# Load ResNet model
+resnet = models.resnet18(pretrained=True)
+resnet = torch.nn.Sequential(*(list(resnet.children())[:-1]))
+resnet.eval()
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+vectorizer = CountVectorizer()
+
+def download_image(url, save_path):
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            with open(save_path, 'wb') as f:
+                f.write(response.content)
+        else:
+            raise Exception(f"Failed to download image. Status code: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error downloading image: {e}")
+        raise
+
+def image_to_embedding(img_path):
+    img = Image.open(img_path).convert('RGB')
+    img_tensor = transform(img).unsqueeze(0)
+    with torch.no_grad():
+        embedding = resnet(img_tensor).squeeze().numpy()
+    return embedding
+
+def preprocess_text(text):
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    return text.lower()
+
+def text_to_embedding(text):
+    vectors = vectorizer.fit_transform([text])
+    return vectors.toarray()[0]
+
+def match_dog(image_emb, text_emb, lat, lon, opposite_status):
+    matches = []
+    for entry in dogs_collection.find({"status": opposite_status}):
+        dist_km = haversine_distance(lat, lon, entry["lat"], entry["lon"])
+        if dist_km > 80:
+            continue
+
+        image_sim = cosine_similarity([image_emb], [entry["embedding"]])[0][0]
+        text_sim = cosine_similarity([text_emb], [entry["text_embedding"]])[0][0]
+        score = 0.5 * image_sim + 0.5 * text_sim
+
+        entry["_id"] = str(entry["_id"])
+        entry["score"] = score
+        matches.append(entry)
+
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    return matches[:3]
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    return R * (2 * atan2(sqrt(a), sqrt(1 - a)))
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    serve(app, host="0.0.0.0", port=5000)
