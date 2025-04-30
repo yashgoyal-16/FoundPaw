@@ -36,7 +36,7 @@ def get_image(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @app.route("/whatsapp", methods=["POST"])
-def whatsapp_webhook():
+def whatsapp():
     # ✅ Get body and image from form-data
     body = request.form.get("Body", "").lower()
     file = request.files.get("image")
