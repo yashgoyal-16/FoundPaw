@@ -36,35 +36,28 @@ def get_image(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 @app.route("/whatsapp", methods=["POST"])
-def whatsapp():
-    logger.info("Received message from: %s", request.form.get("From", ""))
+def whatsapp_webhook():
+    # ✅ Get body and image from form-data
     body = request.form.get("Body", "").lower()
-    logger.info("Body of the message: %s", body)
-
-    # ✅ Get uploaded image from form-data
     file = request.files.get("image")
+
     if not file or not file.content_type.startswith("image"):
-        logger.warning("No image found or invalid file type.")
-        resp = MessagingResponse()
-        resp.message("❌ Please send a photo of the dog.")
-        return str(resp)
+        app.logger.warning("No image found or invalid file type")
+        return {"success": False, "message": "❌ Please upload a valid dog photo."}, 400
 
     # ✅ Save uploaded image
     img_name = f"{uuid.uuid4()}.jpg"
     img_path = os.path.join(app.config['UPLOAD_FOLDER'], img_name)
     file.save(img_path)
 
-    # ✅ Extract info from body
+    # ✅ Extract info from body text
     status_match = re.search(r"(lost|found)", body)
     location_match = re.search(r"location:\s*([0-9.\-]+),\s*([0-9.\-]+)", body)
     phone_match = re.search(r"phone:\s*(\d+)", body)
     description = body.replace("\n", " ")
 
-    resp = MessagingResponse()
-
     if not (status_match and location_match and phone_match):
-        resp.message("⚠️ Format: 'Lost dog golden retriever... Location: 30.9,75.8 Phone: 98xxxx'")
-        return str(resp)
+        return {"success": False, "message": "⚠️ Format: 'Lost dog golden retriever... Location: 30.9,75.8 Phone: 98xxxx'"}, 400
 
     status = status_match.group(1)
     lat, lon = float(location_match.group(1)), float(location_match.group(2))
@@ -75,15 +68,21 @@ def whatsapp():
     processed_desc = preprocess_text(description)
     text_emb = text_to_embedding(processed_desc)
 
-    # ✅ Check for matches
+    # ✅ Find opposite status match (lost ↔ found)
     opposite_status = "found" if status == "lost" else "lost"
     matches = match_dog(image_emb, text_emb, lat, lon, opposite_status)
 
     if matches:
-        reply = "✅ Possible match found near you!\n"
+        reply = []
         for m in matches:
-            reply += f"\n📍 *Description*: {m['text']}\n📞 *Phone*: {m['phone']}\n🌍 *Location*: {m['lat']}, {m['lon']}\n🖼️ Image: {request.url_root}static/uploads/{m['image_name']}\n"
-        resp.message(reply)
+            reply.append({
+                "description": m['text'],
+                "phone": m['phone'],
+                "location": f"{m['lat']},{m['lon']}",
+                "image_url": f"{request.url_root}static/uploads/{m['image_name']}"
+            })
+        return {"success": True, "matches": reply}
+
     else:
         dogs_collection.insert_one({
             "image_name": img_name,
@@ -96,10 +95,9 @@ def whatsapp():
             "phone": phone,
             "timestamp": datetime.now().isoformat()
         })
-        logger.info("Dog info saved.")
-        resp.message("📦 Dog info saved. We'll notify you if we find a match. 🙏")
+        return {"success": True, "message": "📦 Dog info saved. We'll notify you if we find a match. 🙏"}
 
-    return str(resp)
+    # return str(resp)
 
 # MongoDB Setup
 client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
