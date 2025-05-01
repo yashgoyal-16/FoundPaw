@@ -11,16 +11,16 @@ import torchvision.transforms as transforms
 import torch
 import torchvision.models as models
 from pymongo import MongoClient
-from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import CountVectorizer
 from twilio.twiml.messaging_response import MessagingResponse
 from waitress import serve
 import logging
 
-# Flask Setup
+# ✅ Flask Setup
 app = Flask(__name__)
-CORS(app)
-CORS(app, resources={r"/*": {"origins": "https://paw-match-alert-system.vercel.app"}})
+CORS(app, resources={r"/*": {"origins": "*"}})  # ✅ Single, proper CORS setup
+
 # Production Config
 app.config['DEBUG'] = False
 app.config['UPLOAD_FOLDER'] = "static/uploads"
@@ -29,6 +29,25 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# MongoDB Setup
+client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
+db = client["foundpaw"]
+dogs_collection = db["dogs"]
+
+# Load ResNet model
+resnet = models.resnet18(pretrained=True)
+resnet = torch.nn.Sequential(*(list(resnet.children())[:-1]))
+resnet.eval()
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+# ✅ Global vectorizer (fit once)
+vectorizer = CountVectorizer()
+vectorizer.fit(["lost", "found", "dog", "retriever", "location", "phone"])  # ✅ Dummy fit with core vocab
 
 @app.route('/uploads/<filename>')
 def get_image(filename):
@@ -40,8 +59,9 @@ def whatsapp():
     logger.info("Received message from: %s", request.form.get("From", ""))
     body = request.form.get("Body", "").lower()
     logger.info("Body of the message: %s", body)
-    print("form",request.form)
-    # ✅ Get uploaded image from form-data
+    print("form", request.form)
+
+    # ✅ Get uploaded image
     file = request.files.get("image")
     if not file or not file.content_type.startswith("image"):
         logger.warning("No image found or invalid file type.")
@@ -54,7 +74,7 @@ def whatsapp():
     img_path = os.path.join(app.config['UPLOAD_FOLDER'], img_name)
     file.save(img_path)
 
-    # ✅ Extract info from body
+    # ✅ Extract info
     status_match = re.search(r"(lost|found)", body)
     location_match = re.search(r"location:\s*([0-9.\-]+),\s*([0-9.\-]+)", body)
     phone_match = re.search(r"phone:\s*(\d+)", body)
@@ -75,16 +95,17 @@ def whatsapp():
     processed_desc = preprocess_text(description)
     text_emb = text_to_embedding(processed_desc)
 
-    # ✅ Check for matches
+    # ✅ Match logic
     opposite_status = "found" if status == "lost" else "lost"
     matches = match_dog(image_emb, text_emb, lat, lon, opposite_status)
 
     if matches:
         reply = "✅ Possible match found near you!\n"
         for m in matches:
-            reply += f"\n📍 *Description*: {m['text']}\n📞 *Phone*: {m['phone']}\n🌍 *Location*: {m['lat']}, {m['lon']}\n🖼️ Image: {request.url_root}static/uploads/{m['image_name']}\n"
+            reply += f"\n📍 *Description*: {m['text']}\n📞 *Phone*: {m['phone']}\n🌍 *Location*: {m['lat']}, {m['lon']}\n🖼️ Image: {request.url_root}uploads/{m['image_name']}\n"
         resp.message(reply)
     else:
+        # ✅ Save to DB
         dogs_collection.insert_one({
             "image_name": img_name,
             "embedding": image_emb.tolist(),
@@ -101,23 +122,7 @@ def whatsapp():
 
     return str(resp)
 
-# MongoDB Setup
-client = MongoClient("mongodb+srv://chetansharma9878600494:dMqlC78qVxwSeZbV@cluster0.qjmwt22.mongodb.net/")
-db = client["foundpaw"]
-dogs_collection = db["dogs"]
-
-# Load ResNet model
-resnet = models.resnet18(pretrained=True)
-resnet = torch.nn.Sequential(*(list(resnet.children())[:-1]))
-resnet.eval()
-
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
-
-vectorizer = CountVectorizer()
-
+# ✅ Utilities
 def download_image(url, save_path):
     try:
         response = requests.get(url)
@@ -142,7 +147,7 @@ def preprocess_text(text):
     return text.lower()
 
 def text_to_embedding(text):
-    vectors = vectorizer.fit_transform([text])
+    vectors = vectorizer.transform([text])
     return vectors.toarray()[0]
 
 def match_dog(image_emb, text_emb, lat, lon, opposite_status):
@@ -152,8 +157,16 @@ def match_dog(image_emb, text_emb, lat, lon, opposite_status):
         if dist_km > 80:
             continue
 
-        image_sim = cosine_similarity([image_emb], [entry["embedding"]])[0][0]
-        text_sim = cosine_similarity([text_emb], [entry["text_embedding"]])[0][0]
+        # ✅ Ensure numpy arrays
+        entry_image_emb = np.array(entry["embedding"])
+        entry_text_emb = np.array(entry["text_embedding"])
+
+        # ✅ Skip mismatched dims safely
+        if entry_text_emb.shape != text_emb.shape:
+            continue
+
+        image_sim = cosine_similarity([image_emb], [entry_image_emb])[0][0]
+        text_sim = cosine_similarity([text_emb], [entry_text_emb])[0][0]
         score = 0.5 * image_sim + 0.5 * text_sim
 
         entry["_id"] = str(entry["_id"])
